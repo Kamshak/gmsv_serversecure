@@ -142,7 +142,8 @@ namespace netfilter
 	{
 		PacketTypeInvalid = -1,
 		PacketTypeGood,
-		PacketTypeInfo
+		PacketTypeInfo,
+		PacketTypePlayer
 	};
 
 	class CSteamGameServerAPIContext
@@ -261,6 +262,27 @@ namespace netfilter
 	static uint32_t info_cache_last_update = 0;
 	static uint32_t info_cache_time = 5;
 
+	static char player_cache_buffer[4096] = { 0 };
+	static bf_write player_cache_packet(player_cache_buffer, sizeof(player_cache_buffer));
+	static uint32_t player_cache_last_update = 0;
+	struct player_t
+	{
+		byte index;
+		std::string name;
+		double score;
+		double time;
+	};
+
+	struct reply_player_t
+	{
+		bool dontsend;
+		bool senddefault;
+
+		byte count;
+		std::vector<player_t> players;
+	};
+
+
 	static ClientManager client_manager;
 
 	static const size_t packet_sampling_max_queue = 50;
@@ -272,6 +294,8 @@ namespace netfilter
 	static IServerGameDLL *gamedll = nullptr;
 	static IVEngineServer *engine_server = nullptr;
 	static IFileSystem *filesystem = nullptr;
+
+	static GarrysMod::Lua::ILuaBase *lua = nullptr;
 
 	static void BuildStaticReplyInfo( )
 	{
@@ -384,6 +408,110 @@ namespace netfilter
 		info_cache_packet.WriteLongLong( appid );
 	}
 
+	static reply_player_t CallPlayerHook(const sockaddr_in &from)
+	{
+		reply_player_t newreply;
+		newreply.dontsend = false;
+		newreply.senddefault = true;
+
+
+		char hook[] = "A2S_PLAYER";
+
+		lua->GetField(GarrysMod::Lua::INDEX_GLOBAL, "hook");
+		if (!lua->IsType(-1, GarrysMod::Lua::Type::TABLE))
+		{
+			lua->Pop(2);
+			lua->PushString("A2S_PLAYER: hook is not a table!\n");
+			lua->Error();
+			return newreply;
+		}
+
+		lua->GetField(-1, "Run");
+		lua->Remove(-2);
+		if (!lua->IsType(-1, GarrysMod::Lua::Type::FUNCTION))
+		{
+			lua->Pop(2);
+			lua->PushString("A2S_PLAYER: Global hook.Run is not a function!\n");
+			lua->Error();
+			return newreply;
+		}
+
+		lua->PushString(hook);
+		lua->PushString(inet_ntoa(from.sin_addr));
+		lua->PushNumber(27015);
+
+		if (lua->PCall(3, 1, 0) != 0) {
+			lua->FormattedError("\n[%s] %s\n\n", hook, lua->GetString(-1));
+		}
+
+		if (lua->IsType(-1, GarrysMod::Lua::Type::BOOL))
+		{
+			if (!lua->GetBool(-1))
+			{
+				newreply.senddefault = false;
+				newreply.dontsend = true; // dont send when return false
+			}
+		}
+		else if (lua->IsType(-1, GarrysMod::Lua::Type::TABLE))
+		{
+			newreply.senddefault = false;
+
+			int count = lua->ObjLen(-1);
+			newreply.count = count;
+
+			std::vector<player_t> newPlayers(count);
+
+			for (int i = 0; i < count; i++)
+			{
+				player_t newPlayer;
+				newPlayer.index = i;
+
+				lua->PushNumber(i + 1);
+				lua->GetTable(-2);
+
+				lua->GetField(-1, "name");
+				newPlayer.name = lua->GetString(-1);
+				lua->Pop(1);
+
+				lua->GetField(-1, "score");
+				newPlayer.score = lua->GetNumber(-1);
+				lua->Pop(1);
+
+				lua->GetField(-1, "time");
+				newPlayer.time = lua->GetNumber(-1);
+				lua->Pop(1);
+
+				lua->Pop(1);
+				newPlayers.at(i) = newPlayer;
+			}
+
+			newreply.players = newPlayers;
+		}
+
+		lua->Pop(1);
+
+		return newreply;
+	}
+
+
+	static void BuildPlayerReply(reply_player_t &players) {
+		player_cache_packet.Reset();
+		player_cache_packet.WriteLong(-1); // connectionless packet header
+		player_cache_packet.WriteByte('D'); // packet type is always 'D'
+
+		// Players
+		player_cache_packet.WriteByte(players.count);
+		
+		for (int i = 0; i < players.count; i++)
+		{
+			player_t player = players.players[i];
+			player_cache_packet.WriteByte(i);
+			player_cache_packet.WriteString(player.name.c_str());
+			player_cache_packet.WriteLong(player.score);
+			player_cache_packet.WriteFloat(player.time);
+		}
+	}
+
 	inline PacketType SendInfoCache( const sockaddr_in &from, uint32_t time )
 	{
 		if( time - info_cache_last_update >= info_cache_time )
@@ -404,6 +532,29 @@ namespace netfilter
 		return PacketTypeInvalid; // we've handled it
 	}
 
+	inline PacketType SendPlayerCache(const sockaddr_in &from, uint32_t time)
+	{
+		reply_player_t player = CallPlayerHook(from);
+		if (player.senddefault)
+			return PacketTypeGood;
+
+		if (player.dontsend)
+			return PacketTypeInvalid; // dont send it
+
+		BuildPlayerReply(player);
+
+		sendto(
+			game_socket,
+			reinterpret_cast<char *>(player_cache_packet.GetData()),
+			player_cache_packet.GetNumBytesWritten(),
+			0,
+			reinterpret_cast<const sockaddr *>(&from),
+			sizeof(from)
+		);
+
+		return PacketTypeInvalid; // we've handled it
+	}
+
 	inline PacketType HandleInfoQuery( const sockaddr_in &from )
 	{
 		uint32_t time = static_cast<uint32_t>( globalvars->realtime );
@@ -414,6 +565,14 @@ namespace netfilter
 			return SendInfoCache( from, time );
 
 		return PacketTypeGood;
+	}
+
+	inline PacketType HandlePlayerQuery(const sockaddr_in &from) {
+		uint32_t time = static_cast<uint32_t>(globalvars->realtime);
+		if (!client_manager.CheckIPRate(from.sin_addr.s_addr, time))
+			return PacketTypeInvalid;
+
+		return SendPlayerCache(from, time);
 	}
 
 	inline const char *IPToString( const in_addr &addr )
@@ -496,7 +655,7 @@ namespace netfilter
 
 			case 'U': // player info request
 			case 'V': // rules request
-				return len == 9 ? PacketTypeGood : PacketTypeInvalid;
+				return len == 9 ? PacketTypePlayer : PacketTypeInvalid;
 
 			case 'q': // connection handshake init
 			case 'k': // steam auth packet
@@ -598,6 +757,9 @@ namespace netfilter
 		PacketType type = ClassifyPacket( buf, len, infrom );
 		if( type == PacketTypeInfo )
 			type = HandleInfoQuery( infrom );
+
+		if (type == PacketTypePlayer)
+			type = HandlePlayerQuery(infrom);
 
 		if( type == PacketTypeInvalid )
 			return -1;
@@ -1047,6 +1209,8 @@ namespace netfilter
 
 		LUA->PushCFunction( GetSamplePacket );
 		LUA->SetField( -2, "GetSamplePacket" );
+
+		lua = LUA;
 	}
 
 	void Deinitialize( GarrysMod::Lua::ILuaBase * )
